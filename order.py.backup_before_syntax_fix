@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Order Manager — REAL orders on Binance Futures USDT-M with PAPER_MODE support."""
+import os
+import math
+import logging
+from binance.client import Client
+from binance.enums import *
+import time
+import pandas as pd
+import numpy as np
+from utils import log_trade # Import log_trade from utils
+
+log = logging.getLogger("order")
+
+_client = None
+_symbol_info_cache = {} # Cache symbol info
+_order_cache = {} # Cache for placed orders to avoid duplicates
+
+def get_client():
+    """Get or create Binance client from environment using keys."""
+    global _client
+    if _client is None:
+        api_key = os.environ.get("BINANCE_API_KEY", "")
+        api_secret = os.environ.get("BINANCE_API_SECRET", "")
+        use_testnet = os.environ.get("BINANCE_USE_TESTNET", "false").lower() == "true"
+        
+        if not api_key or not api_secret:
+            log.error("Missing Binance API credentials. Set BINANCE_API_KEY and BINANCE_API_SECRET as environment variables.")
+            raise ValueError("API Key or Secret not found.")
+            
+        _client = Client(api_key, api_secret, testnet=use_testnet)
+        log.info(f"Binance client initialized. Testnet mode: {use_testnet}")
+    return _client
+
+def set_leverage(client, symbol, leverage):
+    """Set leverage for a symbol."""
+    try:
+        leverage = max(1, int(leverage)) # Ensure leverage is positive integer
+        log.info(f"Attempting to set leverage to {leverage}x for {symbol}...")
+        client.futures_change_leverage(symbol=symbol, leverage=str(leverage))
+        log.info(f"Leverage successfully set to {leverage}x for {symbol}")
+        return True
+    except Exception as e:
+        log.warning(f"Could not set leverage for {symbol}: {e}")
+        return False
+
+def set_margin_type(client, symbol, margin_type="ISOLATED"):
+    """Set margin type for a symbol (ISOLATED or CROSSED). Default ISOLATED."""
+    try:
+        # Check current margin type first
+        current_positions = client.futures_position_information(symbol=symbol)
+        current_margin_type = None
+        for pos in current_positions:
+            if pos["symbol"] == symbol:
+                current_margin_type = pos["marginType"]
+                break
+
+        if current_margin_type and current_margin_type.upper() == margin_type.upper():
+            log.info(f"Margin type already set to {margin_type} for {symbol}.")
+            return True
+            
+        client.futures_change_margin_type(symbol=symbol, marginType=margin_type.upper())
+        log.info(f"Margin type set to {margin_type} for {symbol}.")
+        return True
+    except Exception as e:
+        # Catch common error for "margin type not changed" to avoid warning
+        if "margin type not changed" in str(e).lower() or "already set" in str(e).lower():
+            log.info(f"Margin type for {symbol} is already {margin_type}.")
+            return True
+        log.warning(f"Could not set margin type for {symbol}: {e}")
+        return False
+
+
+def get_symbol_info(client, symbol):
+    """Get symbol precision info for quantity and price."""
+    if symbol in _symbol_info_cache:
+        return _symbol_info_cache[symbol]
+    
+    try:
+        info = client.futures_exchange_info()
+        for s in info.get("symbols", []):
+            if s["symbol"] == symbol:
+                qty_precision = s.get("quantityPrecision", 3)
+                price_precision = s.get("pricePrecision", 2)
+                step_size = 0.001 # Default fallback for step size
+                min_qty = 0.001 # Default fallback for minimum quantity
+                max_qty = float('inf') # Default fallback for maximum quantity
+
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        step_size = float(f.get("stepSize", 0.001))
+                        min_qty = float(f.get("minQty", 0.001))
+                        max_qty = float(f.get("maxQty", float('inf')))
+                
+                symbol_data = {
+                    "symbol": symbol,
+                    "qty_precision": qty_precision,
+                    "price_precision": price_precision,
+                    "step_size": step_size,
+                    "min_qty": min_qty,
+                    "max_qty": max_qty,
+                }
+                _symbol_info_cache[symbol] = symbol_data
+                return symbol_data
+    except Exception as e:
+        log.exception(f"Failed to get symbol info for {symbol}: {e}")
+    # Fallback if symbol not found or error occurred
+    return {"symbol": symbol, "qty_precision": 3, "price_precision": 2, "step_size": 0.001, "min_qty": 0.001, "max_qty": float('inf')}
+
+def format_quantity(quantity: float, symbol_info: dict) -> float:
+    """Format quantity according to symbol's step size."""
+    step_size = symbol_info.get("step_size", 0.001)
+    if step_size <= 0: return quantity # Avoid issues with invalid step_size
+    
+    # Calculate precision based on step size for rounding
+    # Example: step=0.001 -> precision=3; step=0.1 -> precision=1
+    # Use np.log10 safely. If step_size is 0 or negative, prec might be infinite/complex.
+    prec = int(round(-np.log10(step_size))) if step_size > 0 and np.isfinite(step_size) else 0
+    
+    # Ensure precision is non-negative
+    prec = max(0, prec) 
+
+    # Round to the calculated precision. Using string formatting for robustness.
+    formatted_qty_str = "{:.{prec}f}".format(quantity, prec=prec)
+    
+    # Convert to float for comparison and API submission
+    formatted_qty = float(formatted_qty_str)
+
+    # Ensure the formatted quantity respects the minQty and maxQty limits
+    min_qty = symbol_info.get("min_qty", 0.001)
+    max_qty = symbol_info.get("max_qty", float('inf'))
+    
+    if formatted_qty < min_qty:
+        log.warning(f"Formatted quantity {formatted_qty} for {symbol_info.get('symbol')} is below minQty {min_qty}. Using minQty.")
+        return min_qty
+    if formatted_qty > max_qty:
+        log.warning(f"Formatted quantity {formatted_qty} for {symbol_info.get('symbol')} exceeds maxQty {max_qty}. Using maxQty.")
+        return max_qty
+        
+    return formatted_qty
+
+def ensure_notional_limits(qty: float, price: float, symbol_info: dict, min_notional: float = 5.0) -> float:
+    """Ensure the notional value (qty * price) meets min_notional requirement."""
+    if price <= 0:
+        log.warning(f"Price is zero or negative ({price}), cannot calculate notional for {symbol_info.get('symbol')}.")
+        return 0.0
+        
+    current_notional = qty * price
+    
+    if current_notional < min_notional:
+        # If current notional is too small, calculate qty needed to meet min_notional
+        qty_to_meet_notional = min_notional / price
+        # Format this target quantity based on symbol step size
+        formatted_qty_for_notional = format_quantity(qty_to_meet_notional, symbol_info)
+        
+        # Re-check notional after formatting to ensure it meets the minimum
+        if formatted_qty_for_notional * price >= min_notional:
+            log.warning(f"Order notional {current_notional:.6f} < {min_notional} USDT. Adjusted qty to {formatted_qty_for_notional:.6f} for {symbol_info.get('symbol')} to meet min notional.")
+            return formatted_qty_for_notional
+        else:
+            log.warning(f"Cannot meet min notional {min_notional} USDT for {symbol_info.get('symbol')} even with adjusted qty {formatted_qty_for_notional:.6f}. Skipping order.")
+            return 0.0 # Indicate order cannot be placed due to notional limits
+    
+    return qty # Return original formatted quantity if notional is sufficient
+
+def place_market_order(symbol: str, side: str, quantity: float, symbol_info: dict | None = None, price: float | None = None):
+    """Place a MARKET order on Binance Futures."""
+    paper = os.environ.get("PAPER_MODE", "false").lower() == "true"
+    client = get_client()
+
+    if symbol_info is None: # Fetch if not provided
+        symbol_info = get_symbol_info(client, symbol)
+    
+    # Get current price if not provided (usually market orders use current ticker price)
+    if price is None:
+        try:
+            mark_price_data = client.futures_mark_price(symbol=symbol)
+            price = float(mark_price_data.get("markPrice", 0.0))
+            if price <= 0:
+                log.error(f"Could not fetch valid mark price for {symbol}. Price is {price}. Cannot proceed with order.")
+                return None
+        except Exception as e:
+            log.exception(f"Failed to fetch mark price for {symbol} for order notional check: {e}")
+            return None
+
+    formatted_qty = format_quantity(quantity, symbol_info)
+    
+    # Ensure quantity calculation respects min_notional
+    notional_qty = ensure_notional_limits(formatted_qty, price, symbol_info)
+    if notional_qty <= 0:
+        log.error(f"Order notional too small after calculation for {symbol}. Skipping order.")
+        return None
+    
+    # Ensure leverage and margin type are set correctly before placing order
+    # Consider moving this to init or a dedicated setup function if issues arise
+    # e.g., get leverage from config/env, and set it.
+    leverage_val = os.environ.get("BINANCE_LEVERAGE", "5")
+    set_leverage(client, symbol, leverage_val) 
+    set_margin_type(client, symbol, "ISOLATED") # Assuming ISOLATED is preferred
+
+    # Add a small delay before placing LIVE order to avoid rapid calls if logic is too fast
+    if not paper:
+        time.sleep(0.5) 
+
+    try:
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=str(notional_qty), # Quantity must be string for API
+            newOrderRespType='FULL' # Get full details on order
+        )
+        log.info("MARKET ORDER placed: %s %s %.6f | OrderId: %s | Status: %s | AvgPrice: %s",
+                 side, symbol, notional_qty, order.get("orderId"), order.get("status", "N/A"), order.get("avgPrice", "N/A"))
+        
+        # Log the trade details for record-keeping
+        trade_data = {
+            "symbol": symbol, "side": side, "entry_price": float(order.get("avgPrice", price)),
+            "quantity": notional_qty, "strategy": "unknown", # Strategy name should come from caller
+            "status": order.get("status", "Unknown"), "orderId": order.get("orderId"),
+            "leverage": leverage_val
+        }
+        log_trade(trade_data)
+        
+        return order
+    except Exception as e:
+        log.exception(f"Failed to place market order {side} {notional_qty} {symbol}: {e}")
+        return None

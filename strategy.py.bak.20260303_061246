@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Strategy module — EMA cross + EMA200 filter, returns dict signal or None."""
+import logging
+from datetime import datetime, timezone
+
+from market_data import fetch_klines, add_indicators
+
+log = logging.getLogger("strategy")
+
+
+def _ensure_ema200(df):
+    if df is None or getattr(df, "empty", True):
+        return df
+    if "ema200" in df.columns:
+        return df
+    if "close" not in df.columns:
+        raise RuntimeError("Missing 'close' column; cannot compute EMA200")
+    df = df.copy()
+    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+    return df
+
+
+def generate_signal(client, symbol, cfg):
+    """
+    Return:
+      - None if no signal
+      - dict: {side, price, atr, strategy, ts}
+    """
+    interval = cfg.get("interval", cfg.get("timeframe", "5m"))
+    limit = int(cfg.get("limit", cfg.get("klines_limit", 300)))
+
+    df = fetch_klines(client, symbol, interval=interval, limit=limit)
+    if df is None or getattr(df, "empty", True) or len(df) < 210:
+        return None
+
+    df = add_indicators(
+        df,
+        ema_fast=int(cfg.get("ema_fast", 9)),
+        ema_slow=int(cfg.get("ema_slow", 21)),
+        rsi_period=int(cfg.get("rsi_period", 14)),
+        atr_period=int(cfg.get("atr_period", 14)),
+    )
+    df = _ensure_ema200(df)
+    if df is None or getattr(df, "empty", True) or len(df) < 3:
+        return None
+
+    prev = df.iloc[-2]
+    last = df.iloc[-1]
+
+    # Required fields
+    if "atr" not in last or "close" not in last:
+        return None
+
+    atr = float(last.get("atr") or 0.0)
+    price = float(last.get("close") or 0.0)
+    if atr <= 0 or price <= 0:
+        return None
+
+    # Indicators
+    ema_fast = last.get("ema_fast")
+    ema_slow = last.get("ema_slow")
+    ema200 = last.get("ema200")
+    rsi = float(last.get("rsi") or 50.0)
+
+    # Need EMAs
+    if any(x is None for x in [ema_fast, ema_slow, ema200]):
+        return None
+
+    # Cross rules
+    long_cross = (prev.get("ema_fast") <= prev.get("ema_slow")) and (ema_fast > ema_slow)
+    short_cross = (prev.get("ema_fast") >= prev.get("ema_slow")) and (ema_fast < ema_slow)
+
+    # Trend filter by EMA200 + basic RSI sanity
+    long_ok = long_cross and (price > float(ema200)) and (rsi < 70)
+    short_ok = short_cross and (price < float(ema200)) and (rsi > 30)
+
+    if not long_ok and not short_ok:
+        return None
+
+    side = "BUY" if long_ok else "SELL"
+    return {
+        "side": side,
+        "price": price,
+        "atr": atr,
+        "strategy": "ema_cross_ema200",
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }

@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Order Manager — REAL orders on Binance Futures USDT-M."""
+import os
+import logging
+from binance.client import Client
+from binance.enums import *
+import time
+import pandas as pd
+import numpy as np
+from utils import log_trade # Import log_trade from utils
+
+log = logging.getLogger("order")
+
+_client = None
+_symbol_info_cache = {} # Cache symbol info
+_order_cache = {} # Cache for placed orders to avoid duplicates
+
+def get_client():
+    """Get or create Binance client from environment using keys."""
+    global _client
+    if _client is None:
+        api_key = os.environ.get("BINANCE_API_KEY", "")
+        api_secret = os.environ.get("BINANCE_API_SECRET", "")
+        use_testnet = os.environ.get("BINANCE_USE_TESTNET", "false").lower() == "true"
+        
+        if not api_key or not api_secret:
+            log.error("Missing Binance API credentials. Set BINANCE_API_KEY and BINANCE_API_SECRET as environment variables.")
+            raise ValueError("API Key or Secret not found.")
+            
+        _client = Client(api_key, api_secret, testnet=use_testnet)
+        log.info(f"Binance client initialized. Testnet mode: {use_testnet}")
+    return _client
+
+def set_leverage(client, symbol, leverage):
+    """Set leverage for a symbol."""
+    try:
+        leverage = max(1, int(leverage)) # Ensure leverage is positive integer
+        log.info(f"Attempting to set leverage to {leverage}x for {symbol}...")
+        client.futures_change_leverage(symbol=symbol, leverage=str(leverage))
+        log.info(f"Leverage successfully set to {leverage}x for {symbol}")
+        return True
+    except Exception as e:
+        log.warning(f"Could not set leverage for {symbol}: {e}")
+        return False
+
+def set_margin_type(client, symbol, margin_type="ISOLATED"):
+    """Set margin type for a symbol (ISOLATED or CROSSED). Default ISOLATED."""
+    try:
+        # Check current margin type first
+        current_positions = client.futures_position_information(symbol=symbol)
+        current_margin_type = None
+        for pos in current_positions:
+            if pos["symbol"] == symbol:
+                current_margin_type = pos["marginType"]
+                break
+
+        if current_margin_type and current_margin_type.upper() == margin_type.upper():
+            log.info(f"Margin type already set to {margin_type} for {symbol}.")
+            return True
+            
+        # This is the line that likely had the syntax error. Ensure it's correct.
+        client.futures_change_margin_type(symbol=symbol, marginType=margin_type.upper()) 
+        log.info(f"Margin type set to {margin_type} for {symbol}.")
+        return True
+    except Exception as e:
+        # Catch common error for "margin type not changed" to avoid warning
+        if "margin type not changed" in str(e).lower() or "already set" in str(e).lower():
+            log.info(f"Margin type for {symbol} is already {margin_type}.")
+            return True
+        log.warning(f"Could not set margin type for {symbol}: {e}")
+        return False
+
+
+def get_symbol_info(client, symbol):
+    """Get symbol precision info for quantity and price."""
+    if symbol in _symbol_info_cache:
+        return _symbol_info_cache[symbol]
+    
+    try:
+        info = client.futures_exchange_info()
+        for s in info.get("symbols", []):
+            if s.get("symbol") == symbol:
+                qty_precision = s.get("quantityPrecision", 3)
+                price_precision = s.get("pricePrecision", 2)
+                step_size = 0.001 # Default fallback
+                min_qty = 0.001 # Default fallback
+                max_qty = float('inf') # Default fallback
+
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        step_size = float(f.get("stepSize", 0.001))
+                        min_qty = float(f.get("minQty", 0.001))
+                        max_qty = float(f.get("maxQty", float('inf')))
+                
+                symbol_data = {
+                    "qty_precision": qty_precision,
+                    "price_precision": price_precision,
+                    "step_size": step_size,
+                    "min_qty": min_qty,
+                    "max_qty": max_qty,
+                }
+                _symbol_info_cache[symbol] = symbol_data
+                return symbol_data
+    except Exception as e:
+        log.exception(f"Failed to get symbol info for {symbol}: {e}")
+    # Fallback if symbol not found or error occurred
+    return {"qty_precision": 3, "price_precision": 2, "step_size": 0.001, "min_qty": 0.001, "max_qty": float('inf')}
+
+def format_quantity(quantity, symbol_info):
+    """Format quantity according to symbol's step size."""
+    step_size = symbol_info.get("step_size", 0.001)
+    if step_size <= 0: return quantity # Avoid issues with invalid step_size
+    
+    # Calculate precision based on step size for rounding
+    # Example: step=0.001 -> precision=3; step=0.1 -> precision=1
+    prec = int(round(-np.log10(step_size))) if step_size > 0 else 0
+    
+    # Round to the calculated precision. Using string formatting for robustness.
+    formatted_qty_str = "{:.{prec}f}".format(quantity, prec=prec)
+    
+    # Ensure the formatted quantity respects the minQty and maxQty limits
+    min_qty = symbol_info.get("min_qty", 0.001)
+    max_qty = symbol_info.get("max_qty", float('inf'))
+    
+    formatted_qty = float(formatted_qty_str)
+
+    if formatted_qty < min_qty:
+        log.warning(f"Formatted quantity {formatted_qty} for symbol is below minQty {min_qty}. Using minQty.")
+        return min_qty
+    if formatted_qty > max_qty:
+        log.warning(f"Formatted quantity {formatted_qty} for symbol exceeds maxQty {max_qty}. Using maxQty.")
+        return max_qty
+        
+    return formatted_qty
+
+def place_market_order(symbol, side, quantity, symbol_info=None, price=None):
+    """Place a MARKET order on Binance Futures."""
+    try:
+        client = get_client()
+        if symbol_info is None: # Fetch if not provided
+            symbol_info = get_symbol_info(client, symbol)
+        
+        formatted_qty = format_quantity(quantity, symbol_info)
+        
+        # Check if quantity is valid after formatting
+        if formatted_qty <= symbol_info.get("min_qty", 0.001):
+            log.error(f"Calculated quantity {formatted_qty} too small for {symbol} (min: {symbol_info.get('min_qty')}). Skipping order.")
+            return None
+
+        # Temporarily set leverage and margin type before placing order if they are not fixed
+        # Consider handling this more robustly, e.g., at bot startup or only when changing
+        set_leverage(client, symbol, os.environ.get("BINANCE_LEVERAGE", "5")) # Use env var for leverage
+        set_margin_type(client, symbol, "ISOLATED") # Assuming ISOLATED is preferred
+
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=str(formatted_qty), # Quantity must be string for API
+            newOrderRespType='FULL' # Get full details on order
+        )
+        log.info("MARKET ORDER placed: %s %s %.4f | OrderId: %s | Status: %s | ExecPrice: %s",
+                 side, symbol, formatted_qty, order.get("orderId"), order.get("status"), order.get("avgPrice", "N/A"))
+        return order
+    except Exception as e:
+        log.exception(f"Failed to place market order {side} {quantity} {symbol}: {e}")
+        return None
+
+def place_stop_loss(symbol, side, quantity_usd, stop_price, symbol_info=None):
+    """Place a STOP_MARKET order as stop loss."""
+    try:
+        client = get_client()
+        if symbol_info is None:
+            symbol_info = get_symbol_info(client, symbol)
+        
+        stop_price = format_price(stop_price, symbol_info) # Format the stop price
+
+        close_side = "SELL" if side == "BUY" else "BUY" # For a BUY order, stop loss is SELL
+        
+        # IMPORTANT: Binance futures STOP_MARKET uses quantity for closing IF position is open.
+        # If quantity is derived from USD value, conversion needed. Example assumes quantity for closing.
+        # This section may need refinement if using `closePosition: "true"` correctly requires position data.
+        # For now, we'll try setting the stopPrice and let Binance match against current positions.
+        
+        # Ensure stop_price is valid (not None or invalid number)
+        if stop_price is None or stop_price <= 0:
+            log.warning(f"Invalid stop_price {stop_price} for {symbol}. Cannot place SL.")
+            return None
+            
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type="STOP_MARKET",
+            stopPrice=str(stop_price),
+            closePosition="true", # This attempts to close the existing position
+            # quantity=str(quantity), # Quantity might be needed if not closing position entirely. For pure SL, closePosition=true is typical.
+            newOrderRespType='FULL'
+        )
+        log.info("STOP LOSS placed: %s %s @ %.2f | OrderId: %s", close_side, symbol, stop_price, order.get("orderId"))
+        return order
+    except Exception as e:
+        log.exception(f"Failed to place stop loss for {symbol}: {e}")
+        return None
+
+def place_take_profit(symbol, side, quantity_usd, tp_price, symbol_info=None):
+    """Place a TAKE_PROFIT_MARKET order."""
+    try:
+        client = get_client()
+        if symbol_info is None:
+            symbol_info = get_symbol_info(client, symbol)
+        
+        tp_price = format_price(tp_price, symbol_info) # Format the TP price
+
+        close_side = "SELL" if side == "BUY" else "BUY" # For a BUY order, TP is SELL
+        
+        if tp_price is None or tp_price <= 0:
+            log.warning(f"Invalid tp_price {tp_price} for {symbol}. Cannot place TP.")
+            return None
+
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=str(tp_price),
+            closePosition="true",
+            newOrderRespType='FULL'
+        )
+        log.info("TAKE PROFIT placed: %s %s @ %.2f | OrderId: %s", close_side, symbol, tp_price, order.get("orderId"))
+        return order
+    except Exception as e:
+        log.exception(f"Failed to place take profit for {symbol}: {e}")
+        return None
+
+def cancel_all_orders(symbol):
+    """Cancel all open orders for a symbol."""
+    client = get_client()
+    try:
+        result = client.futures_cancel_all_open_orders(symbol=symbol)
+        log.info("Cancelled all open orders for %s: %s", symbol, result)
+        return result
+    except Exception as e:
+        log.exception(f"Failed to cancel orders for {symbol}: {e}")
+        return None
+
+def get_balance():
+    """Get USDT futures wallet balance."""
+    try:
+        client = get_client()
+        acc = client.futures_account()
+        # It's crucial to get the correct balance. totalWalletBalance is usually good.
+        return float(acc.get("totalWalletBalance", 0.0))
+    except Exception as e:
+        log.exception("Failed to get balance: %s", e)
+        return 0.0
+
+def get_open_positions():
+    """Get all open positions."""
+    try:
+        client = get_client()
+        positions = client.futures_position_information()
+        # Filter for positions with non-zero amount. 
+        # PositionAmt can be 0.000 even if open, so check for that or size > 0
+        open_pos = [p for p in positions if float(p.get("positionAmt", 0)) != 0.0]
+        return open_pos
+    except Exception as e:
+        log.exception("Failed to get positions: %s", e)
+        return []
+
+def format_price(price, symbol_info):
+    """Format price according to symbol's price precision."""
+    prec = symbol_info.get("price_precision", 2)
+    return float("{:.{prec}f}".format(price, prec=prec))

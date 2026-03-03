@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+import os
+import time
+import sys
+from datetime import datetime, timezone
+from utils import log, load_config, log_trade
+from market import fetch_klines, add_indicators, get_symbol_info
+from strategy import generate_signal
+from risk import RiskManager
+from order import place_market_order
+
+def main():
+cfg = load_config()
+paper = os.environ.get("PAPER_MODE", "false").lower() == "true"
+api_key = os.environ.get("BINANCE_API_KEY", cfg.get("api_key", ""))
+api_secret = os.environ.get("BINANCE_API_SECRET", cfg.get("api_secret", ""))
+use_testnet = (cfg.get("use_testnet", False) or os.environ.get("BINANCE_USE_TESTNET", "false").lower() == "true")
+leverage = int(os.environ.get("BINANCE_LEVERAGE", cfg.get("leverage", 5)))
+mode = "LIVE" if not use_testnet else "TESTNET"
+
+if not api_key or not api_secret:
+    log.error("Missing Binance API credentials. Set BINANCE_API_KEY/SECRET as environment.")
+    sys.exit(1)
+
+log.info(f"Binance Futures Bot ({mode}) starting. PAPER_MODE={paper}.")
+from binance.client import Client
+client = Client(api_key, api_secret, testnet=use_testnet)
+
+risk = RiskManager(cfg)
+risk.leverage = leverage
+risk.initial_balance = 0.0
+
+symbols = cfg.get("symbols", ["BTCUSDT"])
+try:
+    risk.initial_balance = float(client.futures_account().get("totalWalletBalance", 0.0))
+except Exception as e:
+    log.warning("Could not load initial balance: %s", e)
+
+log.info("LIVE loop started. Scanning: %s", ", ".join(symbols))
+
+try:
+    while True:
+        for symbol in symbols:
+            market = fetch_klines(client, symbol=symbol, interval=cfg.get("timeframe", "5m"), limit=cfg.get("klines_limit", 100))
+            if market is None or market.empty:
+                continue
+            sig = generate_signal(client, symbol, cfg)
+            if sig:
+                side = sig["side"]
+                price = float(sig["price"])
+                atr = float(sig["atr"])
+                symbol_info = get_symbol_info(client, symbol)
+                risk.symbol_step = symbol_info.get("step_size", 0.001)
+
+                balance = risk.initial_balance if risk.initial_balance > 0 else cfg.get("initial_balance_usd", 1000)
+                pos_size = risk.calc_position_size(balance, price, atr)
+
+                if pos_size <= 0 or pos_size < symbol_info.get("min_qty", 0.001):
+                    log.warning("Calculated position size %.6f is too small for %s (min_qty=%s).", pos_size, symbol, symbol_info.get("min_qty"))
+                    continue
+
+                sl, tp = risk.calc_sl_tp(price, atr, side)
+                log.info(f"SIGNAL DETECTED => {side} {symbol} @ {price:.4f} | Size={pos_size:.6f} | SL={sl:.4f} | TP={tp:.4f} | Strategy={sig.get('strategy','')}")
+
+                if paper:
+                    log.info("[PAPER] Would place order: {0} {1} {2:.6f} @ {3:.2f}".format(side, symbol, pos_size, price))
+                    log_trade({"symbol": symbol, "side": side, "entry_price": price, "quantity": pos_size, "atr": atr, "strategy": sig.get("strategy",""), "status": "paper", "orderId": None})
+                else:
+                    order = place_market_order(symbol, side, pos_size, symbol_info, price)
+                    if order:
+                        log.info("ORDER SENT: %s %s %.6f @ %.2f | id=%s | status=%s", side, symbol, pos_size, price, order.get("orderId"), order.get("status"))
+                        log_trade({"symbol": symbol, "side": side, "entry_price": price, "quantity": pos_size, "atr": atr, "strategy": sig.get("strategy",""), "orderId": order.get("orderId"), "status": order.get("status")})
+            time.sleep(cfg.get("scan_interval_seconds", 20))
+        time.sleep(1)
+except KeyboardInterrupt:
+    log.info("Bot stopped by user.")
+except Exception as e:
+    log.exception("Unhandled exception: %s", e)
+finally:
+    log.info("Shutdown complete.")
+if name == "main":
+main()

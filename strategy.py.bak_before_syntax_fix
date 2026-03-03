@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Strategy module — Scalping + Trend signals using EMA, RSI, ATR, Volume."""
+import logging
+import pandas as pd # Ensure pandas is imported
+import numpy as np # Ensure numpy is imported
+
+# Import necessary functions from market module
+try:
+    from market import fetch_klines, add_indicators, fetch_price, calc_atr
+except ImportError:
+    log.error("Failed to import market module. Ensure it's in PYTHONPATH.")
+    raise
+
+log = logging.getLogger("strategy")
+
+def generate_signal(client, symbol, cfg):
+    """
+    Analyze a symbol on 5m timeframe and generate trading signal.
+    Returns: dict with signal info or None if no signal.
+    Signal: {"side": "BUY"|"SELL", "symbol": str, "price": float, "atr": float, "strategy": str}
+    """
+    try: # <-- Logic INSIDE try block MUST be indented
+        # Fetch klines with indicators
+        klines_df = fetch_klines(client, symbol=symbol, interval="5m",
+                                  limit=cfg.get("klines_limit", 100)) # Default limit, adjust if needed
+
+        # Need enough data points for indicators
+        min_klines_needed = cfg.get("min_klines_for_indicators", 30) 
+        if klines_df is None or klines_df.empty or len(klines_df) < min_klines_needed:
+            log.debug(f"Not enough kline data ({len(klines_df)} bars) for {symbol}, skipping signal generation.")
+            return None
+
+        # Add indicators
+        klines_df = add_indicators(
+            klines_df,
+            ema_fast=cfg.get("ema_fast", 9),
+            ema_slow=cfg.get("ema_slow", 21),
+            rsi_period=cfg.get("rsi_period", 14),
+            atr_period=cfg.get("atr_period", 14),
+        )
+
+        # Use last row for analysis
+        last = klines_df.iloc[-1]
+        previous = klines_df.iloc[-2] # Need previous row for crossover detection
+
+        ema_fast = last["ema_fast"]
+        ema_slow = last["ema_slow"]
+        rsi = last["rsi"]
+        atr = last["atr"]
+        close = last["close"]
+        volume = last["volume"]
+        volume_sma = last.get("volume_sma") # Use .get for safety if 'volume_sma' key is missing
+
+        # Check for NaNs or zero/non-positive values that would break calculations
+        if pd.isna(ema_fast) or pd.isna(ema_slow) or pd.isna(rsi) or pd.isna(atr) or \
+           volume_sma is None or pd.isna(volume_sma) or \
+           ema_fast <= 0 or ema_slow <= 0 or rsi <= 0 or atr <= 0 or volume_sma <= 0 or close <= 0:
+            log.debug("Invalid indicator values for %s (EMA_F:%.2f, EMA_S:%.2f, RSI:%.2f, ATR:%.2f, VolSMA: %s, Close: %.2f), skipping.", 
+                      symbol, ema_fast, ema_slow, rsi, atr, str(volume_sma), close)
+            return None
+
+        # Volume filter: volume must be significantly above average
+        volume_mult = cfg.get("volume_mult", 1.3)
+        if volume < volume_sma * volume_mult:
+            log.debug("Volume filter failed for %s: volume %.2f < vol_sma %.2f * mult %.2f", symbol, volume, volume_sma, volume_mult)
+            return None
+
+        rsi_oversold = cfg.get("rsi_oversold", 30)
+        rsi_overbought = cfg.get("rsi_overbought", 70)
+
+        signal = None
+
+        # --- TREND + SCALPING LONG ---
+        # EMA fast crosses above EMA slow (bullish crossover)
+        # RSI NOT overbought
+        if previous["ema_fast"] <= previous["ema_slow"] and ema_fast > ema_slow and rsi < rsi_overbought:
+            signal = {
+                "side": "BUY",
+                "symbol": symbol,
+                "price": close,
+                "atr": atr, # Store ATR for SL/TP calculation later
+                "strategy": "trend_scalp_long",
+            }
+
+        # --- TREND + SCALPING SHORT ---
+        # EMA fast crosses below EMA slow (bearish crossover)
+        # RSI NOT oversold
+        elif previous["ema_fast"] >= previous["ema_slow"] and ema_fast < ema_slow and rsi > rsi_oversold:
+            signal = {
+                "side": "SELL",
+                "symbol": symbol,
+                "price": close,
+                "atr": atr,
+                "strategy": "trend_scalp_short",
+            }
+
+        # --- RSI REVERSAL LONG (scalping) ---
+        # RSI oversold and moving up, with bullish trend confirmation (EMA fast > EMA slow)
+        elif previous["rsi"] < rsi_oversold and last["rsi"] >= rsi_oversold and ema_fast > ema_slow:
+            signal = {
+                "side": "BUY",
+                "symbol": symbol,
+                "price": close,
+                "atr": atr,
+                "strategy": "rsi_reversal_long",
+            }
+
+        # --- RSI REVERSAL SHORT (scalping) ---
+        # RSI overbought and moving down, with bearish trend confirmation (EMA fast < EMA slow)
+        elif previous["rsi"] > rsi_overbought and last["rsi"] <= rsi_overbought and ema_fast < 21: # Fixed EMA slow value
+            signal = {
+                "side": "SELL",
+                "symbol": symbol,
+                "price": close,
+                "atr": atr,
+                "strategy": "rsi_reversal_short",
+            }
+
+        if signal:
+            log.info("Generated Signal: %s %s @ %.4f | ATR=%.4f | Strategy=%s",
+                     signal["side"], symbol, close, atr, signal["strategy"])
+        return signal
+
+    except Exception as e:
+        log.exception("Error analyzing %s: %s", symbol, e)
+        return None
