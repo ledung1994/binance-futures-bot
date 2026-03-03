@@ -1,0 +1,12 @@
+[Unit]
+Description=Bot watchdog (healthcheck + restart)
+
+[Service]
+Type=oneshot
+User=dungle
+WorkingDirectory=/home/dungle/binance-futures-bot-workspace/anonymized-bot
+Environment=BOT_RUNTIME_DIR=/home/dungle/binance-futures-bot-workspace/anonymized-bot/.runtime
+Environment=BOT_HEALTH_MAX_AGE_SEC=90
+
+ExecStart=/home/dungle/binance-futures-bot-workspace/anonymized-bot/.venv/bin/python healthcheck.py
+ExecStartPost=/bin/bash -lc 'if [ $$? -ne 0 ]; then systemctl restart bot.service; fi'

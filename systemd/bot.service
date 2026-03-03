@@ -1,0 +1,26 @@
+[Unit]
+Description=Binance Futures Bot (trade_live)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dungle
+WorkingDirectory=/home/dungle/binance-futures-bot-workspace/anonymized-bot
+
+Environment=BOT_RUNTIME_DIR=/home/dungle/binance-futures-bot-workspace/anonymized-bot/.runtime
+Environment=BOT_HEALTH_MAX_AGE_SEC=90
+
+# Load secrets from .env (file is NOT committed)
+EnvironmentFile=/home/dungle/binance-futures-bot-workspace/anonymized-bot/.env
+
+ExecStart=/home/dungle/binance-futures-bot-workspace/anonymized-bot/.venv/bin/python trade_live.py
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run bot watchdog every 60 seconds
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Unit=bot-watchdog.service
+
+[Install]
+WantedBy=timers.target
