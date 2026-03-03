@@ -1,0 +1,23 @@
+.env
+
+# Secrets
+.env
+.env.*
+*.env
+
+# Backups (contain secrets!)
+backup_*/
+backup_patch_*/
+*.bak
+*.bak.*
+*.backup*
+*.tar.gz
+
+# Runtime
+.venv/
+__pycache__/
+*.pyc
+logs/
+log/
+*.log
+*.csv
