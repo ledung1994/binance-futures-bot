@@ -21,3 +21,14 @@ logs/
 log/
 *.log
 *.csv
+
+# --- Patch 2: secrets hardening ---
+.env
+.env.*
+*.env
+backup_*/
+backup_patch_*/
+*.bak
+*.bak.*
+*.backup*
+*.tar.gz
