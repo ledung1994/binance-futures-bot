@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+
+# --- PATCH2: DOTENV (AUTO) START ---
+# Load .env automatically (do not commit .env)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except Exception:
+    pass
+# --- PATCH2: DOTENV (AUTO) END ---
+
 import os
 import sys
 import time

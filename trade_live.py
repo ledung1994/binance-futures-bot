@@ -1,3 +1,12 @@
+# --- PATCH2: DOTENV (AUTO) START ---
+# Load .env automatically (do not commit .env)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except Exception:
+    pass
+# --- PATCH2: DOTENV (AUTO) END ---
+
 # --- PATCH1: GUARDRAILS (AUTO) START ---
 import os
 import logging
