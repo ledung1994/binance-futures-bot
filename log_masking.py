@@ -4,7 +4,7 @@ from typing import List
 
 class MaskingFilter(logging.Filter):
     """
-    Masks secrets in log messages. It replaces any occurrence of the actual
+    Masks secrets in log messages by replacing any occurrence of the actual
     secret values (from env) with '***'.
     """
     def __init__(self, secret_values: List[str]):
@@ -22,7 +22,6 @@ class MaskingFilter(logging.Filter):
             if s and s in new_msg:
                 new_msg = new_msg.replace(s, "***")
 
-        # overwrite message safely
         record.msg = new_msg
         record.args = ()
         return True
@@ -30,14 +29,14 @@ class MaskingFilter(logging.Filter):
 def install_log_masking() -> None:
     """
     Install masking filter on the root logger.
-    Must be called after dotenv load (so env has secrets).
+    Call after dotenv load so env contains the secrets.
     """
     api_key = os.environ.get("BINANCE_API_KEY", "")
     api_secret = os.environ.get("BINANCE_API_SECRET", "")
     flt = MaskingFilter([api_key, api_secret])
 
     root = logging.getLogger()
-    # Avoid installing twice
+    # avoid double-install
     for existing in root.filters:
         if isinstance(existing, MaskingFilter):
             return
