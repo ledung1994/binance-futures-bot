@@ -9,6 +9,17 @@ except Exception:
     pass
 # --- PATCH2: DOTENV (AUTO) END ---
 
+# --- PATCH3: LOG MASKING (AUTO) START ---
+# Mask secrets in logs (BINANCE_API_KEY / BINANCE_API_SECRET)
+try:
+    from log_masking import install_log_masking
+    install_log_masking()
+except Exception:
+    pass
+# --- PATCH3: LOG MASKING (AUTO) END ---
+
+
+
 import os
 import sys
 import time
