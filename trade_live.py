@@ -1,6 +1,11 @@
 # --- PATCH4: HEARTBEAT (AUTO) START ---
+import os
 import json
 from pathlib import Path
+
+# --- PATCH5: PAPER MODE (AUTO) START ---
+from paper import paper_place_market_order_with_tp_sl
+# --- PATCH5: PAPER MODE (AUTO) END ---
 
 _RUNTIME_DIR = Path(os.environ.get("BOT_RUNTIME_DIR", ".runtime"))
 _RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -187,6 +192,9 @@ def main():
         for symbol in symbols:
             try:
                 last = generate_signal(client, symbol, cfg)
+                if last is None:
+                    logger.warning('generate_signal returned None for %s; skipping', symbol)
+                    continue
                 side = _decide_side(last, cfg)
                 if not side:
                     continue
@@ -223,7 +231,19 @@ def main():
                     logging.getLogger('bot.trade_live').exception('Guardrails position error: %s', e)
                 # --- PATCH1: POSITION GUARDRAIL (AUTO) END ---
                 _write_heartbeat(symbol=symbol, note='before_order')
-                res = place_market_order_with_tp_sl(
+                if _env_bool('PAPER_MODE', 'false'):
+                    logger.info('PAPER_MODE=true -> recording paper order %s %s qty=%.8f', side, symbol, qty)
+                    res = paper_place_market_order_with_tp_sl(
+                        symbol=symbol,
+                        side=side,
+                        quantity=qty,
+                        atr=atr,
+                        tp_mult=tp_mult,
+                        sl_mult=sl_mult,
+                        min_notional_usdt=min_notional,
+                    )
+                else:
+                    res = place_market_order_with_tp_sl(
                     symbol=symbol,
                     side=side,
                     quantity=qty,
