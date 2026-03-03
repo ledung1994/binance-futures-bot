@@ -1,3 +1,47 @@
+# --- PATCH1: GUARDRAILS (AUTO) START ---
+import os
+import logging
+
+def _safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+def _futures_equity_usdt(client):
+    """Return (equity, wallet, unrealized) in USDT. Uses python-binance futures_account() if available."""
+    try:
+        acc = client.futures_account()
+        wallet = _safe_float(acc.get("totalWalletBalance", 0.0))
+        upnl = _safe_float(acc.get("totalUnrealizedProfit", 0.0))
+        equity = wallet + upnl
+        return equity, wallet, upnl
+    except Exception:
+        # fallback: wallet only
+        try:
+            bal = client.futures_account_balance()
+            wallet = 0.0
+            for it in bal:
+                if str(it.get("asset", "")).upper() in ("USDT", "BUSD"):
+                    wallet = _safe_float(it.get("balance", 0.0))
+                    break
+            return wallet, wallet, 0.0
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+def _position_notional_usdt(client, symbol: str) -> float:
+    """Estimate position notional = abs(positionAmt) * markPrice."""
+    try:
+        info = client.futures_position_information(symbol=symbol)
+        if isinstance(info, list) and info:
+            info = info[0]
+        amt = _safe_float(info.get("positionAmt", 0.0))
+        mark = _safe_float(info.get("markPrice", 0.0))
+        return abs(amt) * mark
+    except Exception:
+        return 0.0
+# --- PATCH1: GUARDRAILS (AUTO) END ---
+
 #!/usr/bin/env python3
 import os
 import time
@@ -62,7 +106,44 @@ def main():
 
     logger.info("trade_live started. symbols=%s loop_sleep=%.1f", symbols, loop_sleep)
 
+    # --- PATCH1: GUARDRAILS STATE (AUTO) ---
+    max_drawdown_pct = _safe_float(cfg.get('MAX_DRAWDOWN_PCT', cfg.get('max_drawdown_pct', 2.0)), 2.0)
+    max_position_pct = _safe_float(cfg.get('MAX_POSITION_PCT', cfg.get('max_position_pct', 1.0)), 1.0)
+    equity_peak = None
+    circuit_breaker_active = False
+
     while True:
+        # --- PATCH1: GUARDRAILS CHECK (AUTO) START ---
+        # Hard kill-switch via env
+        if str(os.environ.get('BINANCE_KILL_SWITCH', 'false')).lower() == 'true':
+            logging.getLogger('bot.trade_live').warning('BINANCE_KILL_SWITCH=true -> stopping trading loop iteration')
+            time.sleep(max(5.0, loop_sleep))
+            continue
+
+        # Update equity peak + drawdown
+        try:
+            equity, wallet, upnl = _futures_equity_usdt(client)
+            if equity_peak is None:
+                equity_peak = equity
+            equity_peak = max(equity_peak, equity)
+            drawdown_pct = 0.0
+            if equity_peak and equity_peak > 0:
+                drawdown_pct = max(0.0, (equity_peak - equity) / equity_peak * 100.0)
+            if drawdown_pct >= max_drawdown_pct:
+                circuit_breaker_active = True
+                logging.getLogger('bot.trade_live').warning(
+                    'CIRCUIT BREAKER: drawdown %.4f%% >= %.4f%% (equity=%.4f wallet=%.4f upnl=%.4f peak=%.4f)',
+                    drawdown_pct, max_drawdown_pct, equity, wallet, upnl, equity_peak
+                )
+        except Exception as e:
+            logging.getLogger('bot.trade_live').exception('Guardrails equity/drawdown error: %s', e)
+            wallet = None
+
+        if circuit_breaker_active:
+            logging.getLogger('bot.trade_live').warning('Circuit-breaker ACTIVE -> skip all trades this cycle')
+            time.sleep(max(5.0, loop_sleep))
+            continue
+        # --- PATCH1: GUARDRAILS CHECK (AUTO) END ---
         now = datetime.now(timezone.utc).isoformat()
         for symbol in symbols:
             try:
@@ -87,6 +168,21 @@ def main():
 
                 logger.info("Signal %s %s atr=%.8f time=%s", side, symbol, atr, now)
 
+                # --- PATCH1: POSITION GUARDRAIL (AUTO) START ---
+                try:
+                    if wallet is not None:
+                        pos_notional = _position_notional_usdt(client, symbol)
+                        pos_pct = (pos_notional / max(1e-6, float(wallet))) * 100.0
+                        if pos_pct > max_position_pct:
+                            circuit_breaker_active = True
+                            logging.getLogger('bot.trade_live').warning(
+                                'CIRCUIT BREAKER: position %.4f%% > %.4f%% (symbol=%s notional=%.4f wallet=%.4f)',
+                                pos_pct, max_position_pct, symbol, pos_notional, float(wallet)
+                            )
+                            break
+                except Exception as e:
+                    logging.getLogger('bot.trade_live').exception('Guardrails position error: %s', e)
+                # --- PATCH1: POSITION GUARDRAIL (AUTO) END ---
                 res = place_market_order_with_tp_sl(
                     symbol=symbol,
                     side=side,
