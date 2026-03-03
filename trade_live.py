@@ -1,3 +1,21 @@
+# --- PATCH4: HEARTBEAT (AUTO) START ---
+import json
+from pathlib import Path
+
+_RUNTIME_DIR = Path(os.environ.get("BOT_RUNTIME_DIR", ".runtime"))
+_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+_HEARTBEAT_PATH = _RUNTIME_DIR / "heartbeat.json"
+
+def _write_heartbeat(symbol: str | None = None, note: str | None = None) -> None:
+    try:
+        _HEARTBEAT_PATH.write_text(
+            json.dumps({"ts": time.time(), "symbol": symbol, "note": note}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+# --- PATCH4: HEARTBEAT (AUTO) END ---
+
 # --- PATCH2: DOTENV (AUTO) START ---
 # Load .env automatically (do not commit .env)
 try:
@@ -133,6 +151,7 @@ def main():
     circuit_breaker_active = False
 
     while True:
+        _write_heartbeat(symbol=None, note='loop_start')
         # --- PATCH1: GUARDRAILS CHECK (AUTO) START ---
         # Hard kill-switch via env
         if str(os.environ.get('BINANCE_KILL_SWITCH', 'false')).lower() == 'true':
@@ -203,6 +222,7 @@ def main():
                 except Exception as e:
                     logging.getLogger('bot.trade_live').exception('Guardrails position error: %s', e)
                 # --- PATCH1: POSITION GUARDRAIL (AUTO) END ---
+                _write_heartbeat(symbol=symbol, note='before_order')
                 res = place_market_order_with_tp_sl(
                     symbol=symbol,
                     side=side,
